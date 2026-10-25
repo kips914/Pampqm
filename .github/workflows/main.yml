@@ -1,0 +1,105 @@
+name: Build Warhead JAR
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "master"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write   # нужно только для публикации релиза по тегу
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Если папка src загружена -- собираем как есть.
+      # Если папки не грузятся (веб-загрузка) -- берём любой *.zip с проектом из корня репозитория и распаковываем его.
+      - name: Prepare sources
+        id: src
+        run: |
+          if [ -d src/main/java ]; then
+            DIR=.
+          else
+            ZIP=$(ls -1 *.zip 2>/dev/null | head -n 1 || true)
+            if [ -z "$ZIP" ]; then
+              echo "::error::Нет папки src и нет zip с проектом в корне репозитория. Загрузи Warhead_vX.zip в корень."
+              exit 1
+            fi
+            echo "Unpacking $ZIP"
+            rm -rf _proj && mkdir _proj && unzip -q "$ZIP" -d _proj
+            GRADLE_FILE=$(find _proj -name build.gradle | head -n 1)
+            test -n "$GRADLE_FILE" || { echo "::error::В zip нет build.gradle"; exit 1; }
+            DIR=$(dirname "$GRADLE_FILE")
+          fi
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "Project dir: $DIR"
+          echo "Java files:     $(find "$DIR/src/main/java" -name '*.java' 2>/dev/null | wc -l)"
+          echo "Resource files: $(find "$DIR/src/main/resources" -type f 2>/dev/null | wc -l)"
+          test -f "$DIR/src/main/resources/META-INF/mods.toml" || { echo "::error::Нет mods.toml"; exit 1; }
+          test "$(find "$DIR/src/main/java" -name '*.java' | wc -l)" -gt 0 || { echo "::error::Нет .java файлов"; exit 1; }
+
+      - name: Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Gradle 8.8
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.8"
+
+      - name: Build
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: gradle --no-daemon --stacktrace build
+
+      - name: Find mod JAR
+        id: jar
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: |
+          ls -la build/libs
+          JAR=$(ls build/libs/*.jar | grep -v -e '-sources' -e '-javadoc' | head -n 1)
+          test -n "$JAR"
+          echo "path=$PWD/$JAR" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$JAR" .jar)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify JAR content
+        run: |
+          JAR="${{ steps.jar.outputs.path }}"
+          echo "Size: $(stat -c %s "$JAR") bytes"
+          unzip -l "$JAR" | tail -n 40
+          unzip -l "$JAR" | grep -q 'META-INF/mods.toml' || { echo "::error::В jar нет mods.toml"; exit 1; }
+          unzip -l "$JAR" | grep -q 'com/warhead/WarheadMod.class' || { echo "::error::В jar нет классов мода"; exit 1; }
+
+      - name: Upload JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.jar.outputs.name }}
+          path: ${{ steps.jar.outputs.path }}
+          if-no-files-found: error
+
+      - name: Upload build reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            ${{ steps.src.outputs.dir }}/build/reports/**
+            ${{ steps.src.outputs.dir }}/build/test-results/**
+          if-no-files-found: ignore
+
+      - name: Publish release (tags v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.jar.outputs.path }}
